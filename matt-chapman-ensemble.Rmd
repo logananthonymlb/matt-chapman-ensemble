@@ -1,0 +1,624 @@
+---
+title: "Predicting Matt Chapman’s Next Swing"
+author: "Logan Mottley"
+date: "6/15/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(tidymodels)
+library(ranger)
+library(themis)
+library(stacks)
+library(xgboost)
+library(egg)
+library(GGally)
+library(ggthemr)
+options(scipen=999)
+ggthemr("flat dark", type="outer")
+
+# set seed
+set.seed(510)
+
+doParallel::registerDoParallel()
+```
+
+### Data Organization
+```{r}
+  
+# load data
+pitcher.data.2019 <- read.csv("~/Desktop/Baseball/R/matt-chapman-ensemble/Statcast Pitcher (2019).csv")
+
+# making an empty at_bat and state column
+pitcher.data.2019 <- pitcher.raw.2019 %>%
+  mutate(at_bat = "", 
+         state = "", 
+         matchup = "") 
+
+# making a matchup variable 
+pitcher.data.2019$matchup <- paste(pitcher.data.2019$batter,
+                            pitcher.data.2019$player_name, 
+                            sep = "-")
+  
+# making a state variable for count
+pitcher.data.2019$state <- paste(pitcher.data.2019$balls,
+                            pitcher.data.2019$strikes, 
+                            sep = "-")
+
+# factor/numeric
+pitcher.data.2019$release_spin_rate <- as.numeric(as.character(pitcher.data.2019$release_spin_rate))
+#pitcher.data.2019$batter <- factor(pitcher.data.2019$batter)
+
+
+# on hot function (credit: https://gist.github.com/EmilHvitfeldt/482412fa4ea7246a11c7b7a8504b7997)
+one_hot <- function(data, var) {
+
+  var_enquo <- enquo(var)
+  items <- data %>% pull(!!var_enquo)
+  items_unique <- items %>% unique()
+  
+  out <- matrix(0, NROW(data), length(items_unique))
+  colnames(out) <- items_unique
+  
+  for (i in items_unique) {
+    out[, i] <- items == i
+  }
+  
+  data %>%
+    select(-!!var_enquo) %>%
+    bind_cols(as_tibble(out))
+}
+
+#levels(pitcher.data.2019$description)
+
+# filter out bullshit pitches 
+chappy <- pitcher.data.2019 %>%
+  filter(batter == 656305) %>%
+  mutate(swing = ifelse(description == "swing" |
+                                  description == "foul_tip"|
+                                  description == "hit_into_play_no_out"|
+                                  description == "foul"|
+                                  description == "hit_into_play_score"|
+                                  description == "hit_into_play"|
+                                  description == "swing_blocked", 1, 0)) %>%
+  select(swing, player_name, pitch_type, state, plate_x, plate_z, 
+         release_speed, release_spin_rate) %>%
+  ungroup() %>%
+  mutate(swing = factor(swing)) %>%
+  na.omit()
+
+# one hot encoding of pitch type and state and pitcher name
+chappy <- one_hot(chappy, pitch_type)
+chappy <- one_hot(chappy, state)
+chappy <- one_hot(chappy, player_name)
+
+```
+
+### EDA
+```{r}
+
+## swings vs release_speed and release_spin_rate
+chappy %>%
+  select(swing, release_speed, release_spin_rate) %>%
+  rename(Swing = swing) %>%
+  rename(Velocity = release_speed) %>%
+  rename(SpinRate = release_spin_rate) %>%
+  mutate(Swing = ifelse(Swing == 1, "Swing", "No Swing")) %>%
+  ggpairs(title = "Matt Chapman, 2019: Swings vs. Relase Speed and Spin Rate",
+          aes(color = Swing,  alpha = 0.5)) + 
+    theme(text = element_text(family="DIN Alternate Bold"), 
+        plot.title = element_text(hjust = .5, size = 20), 
+        plot.subtitle = element_text(hjust = 0.15, size = 12),
+        axis.title.x = element_text(size = 20), 
+        axis.title.y = element_text(size = 20), 
+        axis.text.x = element_text(size = 12), 
+        axis.text.y = element_text(size = 12),
+        axis.line = element_blank()) 
+
+# Swings by Count, Pitch Type, and Pitcher
+pitcher.data.2019 %>%
+  filter(batter == 656305, 
+         pitch_type != "null") %>%
+  mutate(swing = ifelse(description == "swing" |
+                                  description == "foul_tip"|
+                                  description == "hit_into_play_no_out"|
+                                  description == "foul"|
+                                  description == "hit_into_play_score"|
+                                  description == "hit_into_play"|
+                                  description == "swing_blocked", 1, 0), 
+         swing = factor(swing), 
+         player_name = fct_lump(player_name, 15)) %>%
+  select(swing, pitch_type, state, player_name) %>%
+  ungroup() %>%
+  na.omit() %>%
+  mutate(Swing = ifelse(swing == 1, "Swing", "No Swing")) %>%
+  rename(Count = state) %>%
+  rename(Pitch = pitch_type) %>%
+  rename(Pitcher = player_name) %>%
+  pivot_longer(Pitch:Pitcher) %>%
+  ggplot(aes(y = value, fill = Swing)) + 
+  geom_bar(position = "fill") + 
+  facet_wrap(~ name, scales = "free") + 
+  scale_x_continuous(labels = percent_format()) + 
+  labs(y = NULL, x = NULL, fill = NULL) + 
+  geom_vline(xintercept = 0.5, linetype = "dashed", 
+             color= "white", alpha = 0.3) + 
+  labs(title = "Matt Chapman, 2019: Swings by Count, Pitch Type, and Pitcher", 
+       subtitle = "(pitcher column: top 15 by most pitches thrown to Chapman)") + 
+      theme(text = element_text(family="DIN Alternate Bold"), 
+        plot.title = element_text(hjust = .5, size = 20), 
+        plot.subtitle = element_text(hjust = 0, size = 10),
+        axis.title.x = element_text(size = 20), 
+        axis.title.y = element_text(size = 20), 
+        axis.text.x = element_text(size = 12), 
+        axis.text.y = element_text(size = 12),
+        axis.line = element_blank(), 
+        strip.text.x = element_text(size = 14))
+  
+```
+
+### Split data 
+```{r}
+
+# set seed
+set.seed(510)
+
+# split data
+chappy_split <- initial_split(chappy, prop = 0.7) 
+
+# training data
+chappy_train <- chappy_split %>%
+  training() 
+
+# testing data
+chappy_test <- chappy_split %>%
+  testing() 
+
+# training cross val
+train_fold <- chappy_train %>%
+  vfold_cv(10, strata = swing)
+  
+```
+
+Random Forest 
+```{r}
+
+set.seed(510)
+
+# recipe
+rf_rec <- recipe(swing ~., data = chappy_train) %>%
+  step_zv(all_predictors()) %>%
+  step_normalize(all_predictors()) 
+
+# prep
+rf_prep <- prep(rf_rec)
+juice(rf_prep)
+
+# specify model 
+rf_spec <- rand_forest(trees = 200,
+                       mtry = tune(),
+                       min_n = tune()) %>%
+  set_mode("classification") %>%
+  set_engine("ranger")
+
+# workflow
+rf_wf <- workflow() %>%
+  add_recipe(rf_rec) %>%
+  add_model(rf_spec)
+
+# gridsearch for tuning 
+rf_grid <- grid_regular(mtry(range = c(10, 30)),
+                        min_n(range = c(2, 8)),
+                        levels = 5)
+
+# fit workflow to resamples 
+rf_res <- rf_wf %>%
+  tune_grid(train_fold,
+            grid = rf_grid,
+            control = control_grid(save_pred = TRUE),
+            metrics = metric_set(precision, recall, accuracy, 
+                                 roc_auc, sens, spec))
+
+# collect metrics and plot roc curve
+
+rf_res %>% 
+  collect_predictions() %>%
+  roc_curve(swing, .pred_0) %>%
+  ggplot() + 
+  geom_smooth(aes(sensitivity, specificity), 
+              size = 2.5) + 
+  geom_abline(intercept = 1, slope = 1, 
+              linetype = "dashed", size = 1.5) + 
+  scale_x_reverse() + 
+  coord_fixed(1) + 
+  labs(title = "ROC Curve on Resamples",
+       subtitle = "(Random Forest Model)") + 
+      theme(text = element_text(family="DIN Alternate Bold"), 
+        plot.title = element_text(hjust = .5, size = 20), 
+        plot.subtitle = element_text(hjust = 0, size = 15),
+        axis.title.x = element_text(size = 20), 
+        axis.title.y = element_text(size = 20), 
+        axis.text.x = element_text(size = 12), 
+        axis.text.y = element_text(size = 12),
+        axis.line = element_blank(), 
+        legend.position = "none")
+
+```
+
+### Logistic Regression 
+```{r}
+
+set.seed(510)
+
+# recipe
+log_rec <- recipe(swing ~ ., data = chappy_train) %>%  
+  step_zv(all_predictors()) %>%
+  step_normalize(all_predictors()) %>%
+  step_ns(plate_z, plate_z, release_spin_rate,  
+          release_speed, chappy_train$`0-0`, 
+          chappy_train$`0-1`, chappy_train$`0-2`, 
+          chappy_train$`1-2`, chappy_train$`2-2`,  
+          chappy_train$`3-2`, chappy_train$`3-1`,
+          chappy_train$`3-0`, chappy_train$`2-2`,
+          chappy_train$`2-1`, chappy_train$`2-0`,
+          chappy_train$`1-0`, chappy_train$`Marco Gonzales`, 
+          chappy_train$`Jose Leclerc`, chappy_train$`Wade Miley`, 
+          chappy_train$`Jose Berrios`, chappy_train$`Mike Leake`, 
+          chappy_train$`Adrian Sampson`, deg_free = 5) 
+
+# prep 
+log_prep <- prep(log_rec)
+juice(log_prep)
+
+# specify model
+log_spec <-  logistic_reg(penalty = tune(), mixture = 1) %>% 
+  set_engine("glmnet")
+
+# workflow
+log_wf <- workflow() %>% 
+  add_model(log_spec) %>% 
+  add_recipe(log_rec)
+
+# gridsearch for tuning 
+log_grid <- tibble(penalty = 10^seq(-10, 1, length.out = 30))
+
+# fit workflow to resamples 
+log_res <- log_wf %>% 
+  tune_grid(train_fold,
+            grid = log_grid,
+            control = control_grid(save_pred = TRUE),
+            metrics = metric_set(precision, recall, accuracy, 
+                                 roc_auc, sens, spec))
+
+# collect and plot metrics
+log_tuned %>% 
+  collect_metrics() %>% 
+    mutate(accuracy = ifelse(.metric == "accuracy", "Accuracy", NA), 
+         precision = ifelse(.metric == "precision", "Precision", NA), 
+         roc_auc = ifelse(.metric == "roc_auc", "AUC", NA), 
+         sens = ifelse(.metric == "sens", "Sensitivity", NA), 
+         spec = ifelse(.metric == "spec", "Specificity", NA), 
+         metrics = coalesce(accuracy, precision, 
+                            roc_auc, sens, spec)) %>%
+  ggplot(aes(x = penalty, y = mean, color = metrics)) + 
+  geom_point(size = 3.5, alpha = 1) + 
+  geom_line(size = 1.5, alpha = 1) + 
+  scale_x_log10(labels = scales::scientific_format()) + 
+    labs(title = "Average Metrics vs. Penalty (Log Scaled)", 
+       subtitle = "(Logistic Regression Model)",
+       x = "Penalty", y = "", color = "Metrics") + 
+      theme(text = element_text(family = "DIN Alternate Bold"), 
+        plot.title = element_text(hjust = .5, size = 20), 
+        plot.subtitle = element_text(hjust = 0, size = 14),
+        axis.title.x = element_text(size = 20), 
+        axis.title.y = element_text(size = 20), 
+        axis.text.x = element_text(size = 12), 
+        axis.text.y = element_text(size = 12),
+        axis.line = element_blank(), 
+        legend.title = element_text(size = 14), 
+        legend.text = element_text(size = 12)) + 
+  geom_vline(xintercept = 0.000672335753649934 , linetype = "dashed", 
+             color = "white", alpha = 0.7, size = 1.2)
+
+```
+
+### Boosted Trees 
+```{r}
+
+set.seed(510)
+ 
+# recipe
+boosted_rec <- recipe(swing ~ ., data = chappy_train) %>%
+  step_zv(all_predictors()) 
+
+# specify model 
+boosted_spec <- boost_tree(mtry = tune(), trees = tune(), 
+                       learn_rate = tune()) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+
+# prep
+boosted_prep <- prep(boosted_rec)
+juice(boosted_prep)
+
+# workflow
+boosted_wf <- workflow() %>% 
+  add_model(boosted_spec) %>% 
+  add_recipe(boosted_rec)
+
+# fit workflow to resamples 
+boosted_res <- boosted_wf %>% 
+  tune_grid(resamples = train_fold,
+            metrics = metric_set(roc_auc, accuracy), 
+            grid = crossing(mtry = c(1, 20, 50, 100), 
+                            learn_rate = seq(0.1, 0.5, .1), 
+                            trees = seq(1, 50, 10)),
+            control = control_grid(save_pred = TRUE))
+
+```
+
+### Ensemble Model 
+```{r}
+ 
+set.seed(510)
+
+# save the tuned model for ensemble 
+rf_tuned <- rf_wf %>% 
+  tune_grid(train_fold,
+            grid = rf_grid,
+            metrics = metric_set(roc_auc), 
+            control = control_stack_grid())
+
+log_tuned <- log_wf %>% 
+  tune_grid(train_fold,
+            grid = log_grid,
+            metrics = metric_set(roc_auc, accuracy, 
+                                 sens, spec, precision), 
+            control = control_stack_grid())
+
+boosted_tuned <- boosted_wf %>% 
+  tune_grid(resamples = train_fold,
+            metrics = metric_set(roc_auc, accuracy), 
+            grid = crossing(mtry = c(1, 20, 50, 100), 
+                            learn_rate = seq(0.1, 0.5, .1), 
+                            trees = seq(1, 50, 10)),
+            control = control_stack_grid())
+
+# fitting finalized models 
+rf_finalized <- rf_wf %>%
+  finalize_workflow(select_best(rf_tuned))
+
+rf_finalized %>%
+  last_fit(chappy_split) %>%
+  collect_predictions() %>%
+  mutate(true_pos = ifelse(.pred_class == 1 & swing ==1, "True Pos", NA), 
+         true_neg = ifelse(.pred_class == 0 & swing == 0, "True Neg", NA), 
+         false_pos = ifelse(.pred_class == 1 & swing == 0, "False Pos", NA),
+         false_neg = ifelse(.pred_class == 0 & swing == 1, "False Neg", NA),
+         label = coalesce(true_pos, true_neg, false_pos, false_neg)) %>%
+  count(label, sort = T)
+  
+
+log_finalized <- log_wf %>%
+  finalize_workflow(select_best(log_tuned, metric = "precision"))
+
+log_finalized %>%
+  last_fit(chappy_split) %>%
+  collect_predictions() %>%
+  mutate(true_pos = ifelse(.pred_class == 1 & swing ==1, "True Pos", NA), 
+         true_neg = ifelse(.pred_class == 0 & swing == 0, "True Neg", NA), 
+         false_pos = ifelse(.pred_class == 1 & swing == 0, "False Pos", NA),
+         false_neg = ifelse(.pred_class == 0 & swing == 1, "False Neg", NA),
+         label = coalesce(true_pos, true_neg, false_pos, false_neg)) %>%
+  count(label, sort = T)
+
+boosted_finalized <- boosted_wf %>%
+  finalize_workflow(select_best(boosted_tuned, metric = "accuracy"))
+
+boosted_finalized %>%
+  last_fit(chappy_split) %>%
+  collect_predictions() %>%
+  mutate(true_pos = ifelse(.pred_class == 1 & swing == 1, "True Pos", NA), 
+         true_neg = ifelse(.pred_class == 0 & swing == 0, "True Neg", NA), 
+         false_pos = ifelse(.pred_class == 1 & swing == 0, "False Pos", NA),
+         false_neg = ifelse(.pred_class == 0 & swing == 1, "False Neg", NA),
+         label = coalesce(true_pos, true_neg, false_pos, false_neg)) %>%
+  count(label, sort = T)
+
+# best models from each
+rf_best <- rf_tuned %>%
+  filter_parameters(parameters = select_best(rf_tuned))
+
+log_best <- log_tuned %>%
+  filter_parameters(parameters = select_best(log_tuned))
+
+boosted_best <- boosted_tuned %>%
+  filter_parameters(parameters = select_best(boosted_tuned))
+
+
+# stacking models and blending predictions
+log_ref_boosted_blended <- stacks() %>% 
+  add_candidates(rf_best) %>%
+  add_candidates(log_best) %>%
+  add_candidates(boosted_best) %>%
+  blend_predictions(metric = metric_set(roc_auc)) %>%
+  fit_members()
+
+autoplot(log_ref_boosted_blended, type = "weights")
+
+# apply blended model on test 
+log_ref_boosted_blended %>%
+  predict(chappy_test) %>%
+  bind_cols(chappy_test) %>%
+  accuracy(swing, .pred_class)
+
+log_ref_boosted_blended %>%
+  predict(chappy_test) %>%
+  bind_cols(chappy_test) %>%
+  precision(swing, .pred_class)
+
+log_ref_boosted_blended %>%
+  predict(chappy_test) %>%
+  bind_cols(chappy_test) %>%
+  sens(swing, .pred_class)
+
+log_ref_boosted_blended %>%
+  predict(chappy_test) %>%
+  bind_cols(chappy_test) %>%
+  spec(swing, .pred_class)
+
+
+```
+
+Plotting Predicted Swing and Misses by Ensemble Model #1
+```{r}
+
+# data
+swings <- log_ref_boosted_blended %>%
+  predict(chappy_test) %>%
+  bind_cols(chappy_test) %>%
+  mutate(false_pos_label = ifelse(.pred_class == 1 & 
+                               swing == 0, "False Positive", NA), 
+         false_neg_label = ifelse(.pred_class == 0 & 
+                               swing == 1, "False Negative", NA), 
+         true_pos_label = ifelse(.pred_class == 1 & 
+                               swing == 1, "True Positive", NA), 
+         true_neg_label = ifelse(.pred_class == 0 & 
+                               swing == 0, "True Negative", NA), 
+         swing_label = coalesce(false_pos_label, false_neg_label, 
+                                true_pos_label, true_neg_label), 
+         FC = ifelse(FC == 1, "FC", NA), 
+         FT = ifelse(FT == 1, "FT", NA), 
+         SL = ifelse(SL == 1, "SL", NA), 
+         FF = ifelse(FF == 1, "FF", NA), 
+         SI = ifelse(SI == 1, "SI", NA), 
+         CH = ifelse(CH == 1, "CH", NA), 
+         CU = ifelse(CU == 1, "CU", NA), 
+         KC = ifelse(KC == 1, "KC", NA), 
+         FS = ifelse(FS == 1, "FS", NA), 
+         pitch_type = coalesce(FC, FT, SL, FF, SI, CH, 
+                               CU, KC, FS), 
+         pitch_type = factor(pitch_type)) %>%
+  rename("zero_zero" = '0-0', 
+         "zero_one" = '0-1', 
+         "zero_two" = '0-2', 
+         "one_two" = '1-2', 
+         "two_two" = '2-2', 
+         "three_two" = '3-2', 
+         "three_zero" = '3-0', 
+         "three_one" = '3-1', 
+         "two_one" = '2-1', 
+         "one_one" = '1-1', 
+         "one_zero" = '1-0', 
+         "two_zero" = '2-0') %>%
+  mutate(zero_zero = ifelse(zero_zero == 1, "0-0", NA),
+         zero_one = ifelse(zero_one == 1, "0-1", NA), 
+         zero_two = ifelse(zero_two == 1, "0-2", NA), 
+         one_two = ifelse(one_two == 1, "1-2", NA), 
+         two_two = ifelse(two_two == 1, "2-2", NA), 
+         three_two = ifelse(three_two == 1, "3-2", NA), 
+         three_zero = ifelse(three_zero == 1, "3-0", NA),
+         three_one = ifelse(three_one == 1, "3-1", NA), 
+         two_one = ifelse(two_one == 1, "2-1", NA), 
+         one_one = ifelse(one_one == 1, "1-1", NA), 
+         one_zero = ifelse(one_zero == 1, "1-0", NA), 
+         two_zero = ifelse(two_zero == 1, "2-0", NA), 
+         state = coalesce(zero_zero, zero_one, zero_two, 
+                          one_two, two_two, three_two, 
+                          three_zero, three_one, two_one, 
+                          one_one, one_zero, two_zero), 
+         state = factor(state))
+
+# building strike zone (credit: https://rpubs.com/himanshu004/baseball_pitch_charts)
+x <- c(-.95,.95,.95,-.95,-.95)
+z <- c(1.6,1.6,3.5,3.5,1.6)
+
+#store in dataframe
+sz <- data.frame(x,z) 
+
+# predicted value labels (strikezone)
+swings %>%
+  ggplot() + 
+  geom_point(aes(x = plate_x, y = plate_z, color = swing_label), 
+             alpha = 0.5, size = 4) + 
+  geom_path(data = sz, aes(x = x, y = z), 
+            size = 1, color = "white", alpha = 0.65) + 
+  coord_fixed(ratio = 1.2) + 
+  labs(title = "Matt Chapman Predicted Swings, 2019", 
+       subtitle = "(Ensemble Model)",
+       x = "", y = "", color = "Predicted Value") + 
+    theme(text = element_text(family="DIN Alternate Bold"), 
+        plot.title = element_text(hjust = 0.5, size = 20), 
+        plot.subtitle = element_text(hjust = 0.1, size = 12),
+        axis.text.x = element_blank(), 
+        axis.text.y = element_blank(),
+        axis.title.x = element_text(size = 17), 
+        axis.title.y = element_text(size = 17), 
+        axis.line = element_blank(), 
+        strip.text.x = element_text(size = 14), 
+        legend.position = "none") + 
+    facet_wrap(~ swing_label) 
+
+# predicted value labels (bar plot)
+swings %>%
+  group_by(swing_label) %>%
+  count(swing_label, sort = T) %>%
+  ggplot(aes(x = reorder(swing_label, -n), y = n, 
+             fill = swing_label)) + 
+  geom_bar(stat = "identity", alpha = 0.6) + 
+  labs(title = "Matt Chapman Predicted Swings, 2019", 
+       subtitle = "(Ensemble Model)",
+       x = "", y = "", fill = "Predicted Value") + 
+    theme(text = element_text(family="DIN Alternate Bold"), 
+        plot.title = element_text(hjust = 0, size = 20), 
+        plot.subtitle = element_text(hjust = 0, size = 12),
+        axis.text.y = element_text(size = 12), 
+        axis.text.x = element_text(size = 12),
+        axis.title.x = element_text(size = 17), 
+        axis.title.y = element_text(size = 17), 
+        axis.line=element_blank(), 
+        legend.position = "none") + 
+  geom_text(aes(label=n, family="DIN Alternate Bold"),
+            position=position_dodge(width=0.9), vjust=-0.25, 
+            size =5) 
+
+# predicted value labels by pitch type
+swings %>%
+  ungroup() %>%
+  mutate(pitch_type = fct_lump(pitch_type, 5)) %>%
+  ggplot() + 
+  geom_point(aes(x = plate_x, y = plate_z, color = factor(pitch_type)), 
+             alpha = 0.5, size = 4) + 
+  geom_path(data = sz, aes(x = x, y = z), 
+            size = 1, color = "white", alpha = 0.65) + 
+  coord_fixed(ratio = 1.2) + 
+  facet_wrap(~swing_label)
+
+# predicted value labels by state
+swings %>%
+  filter(swing_label != "True Positive",
+         swing_label != "True Negative") %>%
+  ggplot() + 
+  geom_point(aes(x = plate_x, y = plate_z, color = swing_label), 
+             alpha = 0.5, size = 4) + 
+  geom_path(data = sz, aes(x = x, y = z), 
+            size = 1, color = "white", alpha = 0.65) + 
+  coord_fixed(ratio = 1.2) + 
+  facet_wrap(~state) + 
+    labs(title = "Matt Chapman Predicted Swings, 2019", 
+       subtitle = "(Ensemble Model)",
+       x = "", y = "", color = "Predicted Value") + 
+    theme(text = element_text(family="DIN Alternate Bold"), 
+        plot.title = element_text(hjust = 0.5, size = 20), 
+        plot.subtitle = element_text(hjust = 0, size = 12),
+        axis.text.y = element_blank(), 
+        axis.text.x = element_blank(),
+        axis.title.x = element_blank(), 
+        axis.title.y = element_blank(), 
+        axis.line=element_blank(), 
+        strip.text.x = element_text(size = 14)) 
+
+```
